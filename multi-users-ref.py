@@ -413,6 +413,73 @@ def logout_user() -> None:
     st.session_state.sessions_loaded = False
 
 
+@st.dialog("📝 회원가입")
+def open_signup_dialog() -> None:
+    """페이지 라우팅(pages/sign_up 없음) 실패 시에도 단일 파일 배포에서 가입 가능."""
+    st.caption(
+        "user id 와 비밀번호로 계정을 만듭니다. 가입 후 이 창을 닫고 같은 정보로 로그인하세요."
+    )
+    if not supabase:
+        st.error("Supabase 가 연결되어 있지 않습니다.")
+        return
+    try:
+        supabase.table("app_users").select("id").limit(1).execute()
+    except Exception as probe_err:
+        if is_missing_table_error(probe_err):
+            st.error("`public.app_users` 테이블이 없습니다. SQL Editor 에서 아래를 실행한 뒤 새로고침하세요.")
+            with st.expander("app_users 생성 SQL (복사)", expanded=True):
+                st.code(_bootstrap_app_users_sql_text(), language="sql")
+            return
+        st.error(f"Supabase 확인 실패: {probe_err}")
+        return
+
+    su_login = st.text_input("user id", key="signup_dlg_login_id")
+    su_pw = st.text_input("비밀번호 (6자 이상)", type="password", key="signup_dlg_pw")
+    su_pw2 = st.text_input("비밀번호 확인", type="password", key="signup_dlg_pw2")
+    if st.button("가입하기", type="primary", use_container_width=True, key="signup_dlg_submit"):
+        if not su_login or not su_pw:
+            st.warning("user id 와 비밀번호를 입력해주세요.")
+        elif su_pw != su_pw2:
+            st.warning("비밀번호가 일치하지 않습니다.")
+        elif len(su_pw) < 6:
+            st.warning("비밀번호는 6자 이상이어야 합니다.")
+        else:
+            try:
+                exists = (
+                    supabase.table("app_users")
+                    .select("id")
+                    .eq("login_id", su_login.strip())
+                    .limit(1)
+                    .execute()
+                )
+                if exists.data:
+                    st.error("이미 존재하는 user id 입니다.")
+                else:
+                    salt = secrets.token_hex(16)
+                    pw_hash = hash_password(su_pw, salt)
+                    insert_res = (
+                        supabase.table("app_users")
+                        .insert(
+                            {
+                                "id": str(uuid.uuid4()),
+                                "login_id": su_login.strip(),
+                                "password_hash": pw_hash,
+                                "password_salt": salt,
+                            }
+                        )
+                        .execute()
+                    )
+                    if not insert_res.data:
+                        st.error("회원가입에 실패했습니다. 다시 시도해주세요.")
+                    else:
+                        st.success("✅ 가입이 완료되었습니다. 이 창을 닫고 로그인하세요.")
+            except Exception as e:
+                if is_missing_table_error(e):
+                    render_app_users_table_setup_help("main")
+                else:
+                    st.error(f"회원가입 실패: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Retriever (사용자/세션 기반)
 # ---------------------------------------------------------------------------
@@ -972,16 +1039,32 @@ def get_supabase_status() -> Dict[str, Any]:
         "connected": supabase is not None,
         "logged_in": current_user_id() is not None,
         "query_ok": False,
+        "session_query_ok": None,
         "error": None,
     }
-    if supabase and current_user_id():
+    if not supabase:
+        return status
+    try:
+        supabase.table("app_users").select("id").limit(1).execute()
+        status["query_ok"] = True
+    except Exception as e:
+        status["error"] = str(e)
+        if is_missing_table_error(e):
+            status["schema_mismatch"] = (
+                "`app_users` 테이블 없음 — app_users_only.sql 또는 multi-users-ref.sql 실행"
+            )
+    uid = current_user_id()
+    if uid:
         try:
-            supabase.table("sessions").select("id").eq("user_id", current_user_id()).limit(1).execute()
-            status["query_ok"] = True
+            supabase.table("sessions").select("id").eq("user_id", uid).limit(1).execute()
+            status["session_query_ok"] = True
         except Exception as e:
+            status["session_query_ok"] = False
             status["error"] = str(e)
             if is_sessions_user_column_missing_error(e):
-                status["schema_mismatch"] = "구버전 DB: sessions.user_id 없음 — migrate_legacy_sessions_user_id.sql 실행"
+                status["schema_mismatch"] = (
+                    "구버전 DB: sessions.user_id 없음 — migrate_legacy_sessions_user_id.sql 실행"
+                )
     return status
 
 
@@ -1054,10 +1137,11 @@ with st.sidebar:
                         st.success("로그인 되었습니다.")
                         st.rerun()
             if st.button("📝 회원가입", use_container_width=True, type="secondary"):
-                try:
+                # Streamlit Cloud 등에 pages/ 가 없으면 switch_page 대신 다이얼로그로 가입
+                if (current_dir / "pages" / "sign_up.py").is_file():
                     st.switch_page("pages/sign_up.py")
-                except Exception:
-                    st.info("좌측 Pages 메뉴의 '회원가입' 페이지로 이동해주세요.")
+                else:
+                    open_signup_dialog()
 
     st.markdown("---")
 
@@ -1068,7 +1152,12 @@ with st.sidebar:
         st.write(f"KEY 설정: {'✅' if sb_status['has_key'] else '❌'}")
         st.write(f"클라이언트: {'✅' if sb_status['connected'] else '❌'}")
         st.write(f"로그인 상태: {'✅' if sb_status['logged_in'] else '❌'}")
-        st.write(f"쿼리 테스트: {'✅' if sb_status['query_ok'] else '❌'}")
+        st.write(f"app_users 접근: {'✅' if sb_status['query_ok'] else '❌'}")
+        sq = sb_status.get("session_query_ok")
+        if sq is None:
+            st.write("내 세션 조회: — (로그인 후 확인)")
+        else:
+            st.write(f"내 세션 조회: {'✅' if sq else '❌'}")
         if sb_status.get("schema_mismatch"):
             st.info(sb_status["schema_mismatch"])
         if sb_status.get("error"):
